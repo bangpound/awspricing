@@ -67,3 +67,11 @@ RDS_PURCHASE_OPTION = Enum(
     partial_upfront='Partial Upfront',
     all_upfront='All Upfront'
 )
+
+ELASTICACHE_LEASE_CONTRACT_LENGTH = Enum(one_year='1yr', three_year='3yr')
+ELASTICACHE_OFFERING_CLASS = Enum('standard')
+ELASTICACHE_PURCHASE_OPTION = Enum(
+    no_upfront='No Upfront',
+    partial_upfront='Partial Upfront',
+    all_upfront='All Upfront'
+)

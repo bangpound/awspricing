@@ -12,7 +12,10 @@ from .constants import (
     EC2_PURCHASE_OPTION,
     RDS_LEASE_CONTRACT_LENGTH,
     RDS_OFFERING_CLASS,
-    RDS_PURCHASE_OPTION
+    RDS_PURCHASE_OPTION,
+    ELASTICACHE_LEASE_CONTRACT_LENGTH,
+    ELASTICACHE_OFFERING_CLASS,
+    ELASTICACHE_PURCHASE_OPTION
 )
 
 
@@ -610,6 +613,237 @@ class RDSOffer(AWSOffer):
 
         if purchase_option not in RDS_PURCHASE_OPTION.values():
             valid_options = RDS_PURCHASE_OPTION.values()
+            raise ValueError(
+                "Purchase option '{}' is invalid. Valid options are: {}"
+                .format(purchase_option, valid_options)
+            )
+
+
+@implements('AmazonElastiCache')
+class ElastiCacheOffer(AWSOffer):
+
+    HOURS_IN_YEAR = 24 * 365
+
+    def __init__(self, offer_data, *args, **kwargs):
+        # Transform the new data structure to match what AWSOffer expects
+        if 'products' in offer_data:
+            # This is the new format with products and terms at the top level
+            transformed_data = {}
+            for sku, product in offer_data['products'].items():
+                transformed_data[sku] = {
+                    'product': product,
+                    'terms': {
+                        'OnDemand': {},
+                        'Reserved': {}
+                    }
+                }
+                # Add OnDemand terms if they exist
+                if 'OnDemand' in offer_data['terms'] and sku in offer_data['terms']['OnDemand']:
+                    # In the new data structure, all terms are under OnDemand
+                    # We need to separate them into OnDemand and Reserved based on termAttributes
+                    for term_key, term in offer_data['terms']['OnDemand'][sku].items():
+                        if 'termAttributes' in term and 'LeaseContractLength' in term['termAttributes']:
+                            # This is a Reserved term
+                            transformed_data[sku]['terms']['Reserved'][term_key] = term
+                        else:
+                            # This is an OnDemand term
+                            transformed_data[sku]['terms']['OnDemand'][term_key] = term
+                # Add Reserved terms if they exist (though they're likely under OnDemand)
+                if 'Reserved' in offer_data['terms'] and sku in offer_data['terms']['Reserved']:
+                    transformed_data[sku]['terms']['Reserved'] = offer_data['terms']['Reserved'][sku]
+            offer_data = transformed_data
+
+        super(ElastiCacheOffer, self).__init__(offer_data, *args, **kwargs)
+
+        self.default_cache_engine = None
+
+        self._reverse_sku = self._generate_reverse_sku_mapping(
+            'instanceType',
+            'cacheEngine',
+            'location',
+            product_families=['Cache Instance']
+        )
+
+        # Lazily-loaded cache to hold offerTermCodes within a SKU
+        self._reserved_terms_to_offer_term_code = defaultdict(dict)  # type: Dict[str, Dict]
+
+    def get_sku(self,
+                node_type,                  # type: str
+                cache_engine,               # type: str
+                region=None                 # type: Optional[str]
+                ):
+        region = self._normalize_region(region)
+        cache_engine = cache_engine or self.default_cache_engine
+
+        attributes = [node_type, cache_engine, region]
+
+        if not all(attributes):
+            raise ValueError("All attributes are required: {}"
+                             .format(attributes))
+
+        sku = self._reverse_sku.get(self.hash_attributes(*attributes))
+        if sku is None:
+            raise ValueError("Unable to lookup SKU for attributes: {}"
+                             .format(attributes))
+        return sku
+
+    def ondemand_hourly(self,
+                        node_type,                  # type: str
+                        cache_engine,               # type: str
+                        region=None                 # type: Optional[str]
+                        ):
+        # type: (...) -> float
+        sku = self.get_sku(
+            node_type,
+            cache_engine,
+            region=region
+        )
+        offer = self._offer_data[sku]
+        term = offer['terms']['OnDemand']
+        price_dimensions = next(six.itervalues(term))['priceDimensions']
+        price_dimension = next(six.itervalues(price_dimensions))
+        raw_price = price_dimension['pricePerUnit']['USD']
+        return float(raw_price)
+
+    def reserved_hourly(self,
+                        node_type,                                          # type: str
+                        cache_engine,                                       # type: str
+                        lease_contract_length=None,                         # type: Optional[str]
+                        offering_class=ELASTICACHE_OFFERING_CLASS.STANDARD, # type: str
+                        purchase_option=None,                               # type: Optional[str]
+                        amortize_upfront=True,                              # type: bool
+                        region=None                                         # type: Optional[str]
+                        ):
+        # type: (...) -> float
+        self._validate_reserved_price_args(
+            lease_contract_length, offering_class, purchase_option)
+
+        assert lease_contract_length is not None
+        assert offering_class is not None
+        assert purchase_option is not None
+
+        sku = self.get_sku(
+            node_type,
+            cache_engine,
+            region=region
+        )
+
+        term_attributes = [
+            lease_contract_length,
+            offering_class,
+            purchase_option
+        ]
+        term = self._get_reserved_offer_term(sku, term_attributes)
+
+        price_dimensions = term['priceDimensions'].values()
+        hourly_dimension = next(d for d in price_dimensions
+                                if d['unit'].lower() == 'hrs')
+        upfront_dimension = next((d for d in price_dimensions
+                                  if d['description'] == 'Upfront Fee'), None)
+
+        raw_hourly = hourly_dimension['pricePerUnit']['USD']
+        raw_upfront = upfront_dimension['pricePerUnit']['USD'] if upfront_dimension else 0
+
+        hourly = float(raw_hourly)
+        upfront = float(raw_upfront)
+
+        if amortize_upfront:
+            hours = self._get_hours_in_lease_contract_length(
+                lease_contract_length)
+            hourly += (upfront / hours)
+
+        return hourly
+
+    def _get_reserved_offer_term(self, sku, term_attributes):
+        # type: (str, List[str]) -> Dict[str, Any]
+        term_attributes_hash = self.hash_attributes(*term_attributes)
+        offer = self._offer_data[sku]
+        all_terms = offer['terms']['Reserved']
+        sku_terms = self._reserved_terms_to_offer_term_code[sku]
+        if term_attributes_hash not in sku_terms:
+            for term_sku, term in six.iteritems(all_terms):
+                hashed = self._hash_reserved_term_attributes(term)
+                sku_terms[hashed] = term['offerTermCode']
+
+        code = sku_terms[term_attributes_hash]
+        return all_terms['.'.join([sku, code])]
+
+    def _hash_reserved_term_attributes(self, term):
+        attrs = term['termAttributes']
+        return self.hash_attributes(
+            attrs['LeaseContractLength'],
+            attrs['OfferingClass'],
+            attrs['PurchaseOption']
+        )
+
+    @classmethod
+    def _get_hours_in_lease_contract_length(cls, lease_contract_length):
+        if lease_contract_length == '1yr':
+            return cls.HOURS_IN_YEAR
+        elif lease_contract_length == '3yr':
+            return 3 * cls.HOURS_IN_YEAR
+        raise ValueError("Unknown lease contract length: {}"
+                         .format(lease_contract_length))
+
+    def reserved_upfront(self,
+                         node_type,                                          # type: str
+                         cache_engine,                                       # type: str
+                         lease_contract_length=None,                         # type: Optional[str]
+                         offering_class=ELASTICACHE_OFFERING_CLASS.STANDARD, # type: str
+                         purchase_option=None,                               # type: Optional[str]
+                         region=None                                         # type: Optional[str]
+                         ):
+        # type: (...) -> float
+        self._validate_reserved_price_args(
+            lease_contract_length, offering_class, purchase_option)
+
+        assert lease_contract_length is not None
+        assert offering_class is not None
+        assert purchase_option is not None
+
+        sku = self.get_sku(
+            node_type,
+            cache_engine,
+            region=region
+        )
+
+        term_attributes = [
+            lease_contract_length,
+            offering_class,
+            purchase_option
+        ]
+        term = self._get_reserved_offer_term(sku, term_attributes)
+
+        price_dimensions = term['priceDimensions'].values()
+        upfront_dimension = next((d for d in price_dimensions
+                                  if d['description'] == 'Upfront Fee'), None)
+
+        raw_upfront = upfront_dimension['pricePerUnit']['USD'] if upfront_dimension else 0
+        return float(raw_upfront)
+
+    @classmethod
+    def _validate_reserved_price_args(cls,
+                                      lease_contract_length,  # type: Optional[str]
+                                      offering_class,         # type: str
+                                      purchase_option,        # type: Optional[str]
+                                      ):
+        # type: (...) -> None
+        if lease_contract_length not in ELASTICACHE_LEASE_CONTRACT_LENGTH.values():
+            valid_options = ELASTICACHE_LEASE_CONTRACT_LENGTH.values()
+            raise ValueError(
+                "Lease contract '{}' is invalid. Valid options are: {}"
+                .format(lease_contract_length, valid_options)
+            )
+
+        if offering_class not in ELASTICACHE_OFFERING_CLASS.values():
+            valid_options = ELASTICACHE_OFFERING_CLASS.values()
+            raise ValueError(
+                "Offering class '{}' is invalid. Valid options are: {}"
+                .format(offering_class, valid_options)
+            )
+
+        if purchase_option not in ELASTICACHE_PURCHASE_OPTION.values():
+            valid_options = ELASTICACHE_PURCHASE_OPTION.values()
             raise ValueError(
                 "Purchase option '{}' is invalid. Valid options are: {}"
                 .format(purchase_option, valid_options)
